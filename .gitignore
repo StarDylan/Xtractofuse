@@ -1,3 +1,4 @@
 LightGlue/
 .venv/
 *.jpg
+data/
