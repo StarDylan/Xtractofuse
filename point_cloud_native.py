@@ -5,7 +5,7 @@ from PIL import Image
 import argparse
 np.float, np.int = np.float64, np.int_
 import open3d as o3d
-# from plyfile import PlyData, PlyElement
+from plyfile import PlyData, PlyElement
 import subprocess
 
 DEPTH_WIDTH = 256
@@ -60,15 +60,15 @@ def accumulate_point_cloud(pc, rgbd, intrinsics, T_CW):
     pc[0].extend(points)
     pc[1].extend(colors)
 
-# def save_point_cloud_to_ply(filename, points, colors):
-#     vertices = [(points[i, 0], points[i, 1], points[i, 2],
-#              int(colors[i, 0] * 255), int(colors[i, 1] * 255), int(colors[i, 2] * 255))
-#             for i in range(points.shape[0])]
-#     ply_data = PlyElement.describe(
-#         np.array(vertices, dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
-#                                 ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]),
-#         'vertex')
-#     PlyData([ply_data]).write(filename)
+def save_point_cloud_to_ply(filename, points, colors):
+    vertices = [(points[i, 0], points[i, 1], points[i, 2],
+             int(colors[i, 0] * 255), int(colors[i, 1] * 255), int(colors[i, 2] * 255))
+            for i in range(points.shape[0])]
+    ply_data = PlyElement.describe(
+        np.array(vertices, dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+                                ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]),
+        'vertex')
+    PlyData([ply_data]).write(filename)
 
 def visualize_point_cloud(points, colors):
     pcd = o3d.geometry.PointCloud()
@@ -103,7 +103,7 @@ def process_point_clouds(args, data):
 
     points, colors = np.array(pc[0]), np.array(pc[1])
     visualize_point_cloud(points, colors)
-    # save_point_cloud_to_ply("output.ply", points, colors)
+    save_point_cloud_to_ply("output.ply", points, colors)
 
 def main():
     parser = argparse.ArgumentParser()
