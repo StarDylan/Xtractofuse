@@ -22,7 +22,7 @@ np.float = np.float64
 np.int = np.int_
 
 
-def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 100.0) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[float]]:
+def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 100.0, every: int = 1, max_frames: tuple | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[float]]:
     """
     Convert a video dataset to a ground truth point cloud and an experimental point cloud
 
@@ -63,13 +63,17 @@ def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 1
 
     rsme = [rsme_point_clouds(point_cloud_all, point_cloud_ground_truth)]
 
-    for i in range(1, get_total_frames(dataset_dir)):
-        print(f"Processing frame #{i}... Data Load ",end="")
+    for i, frame_id in enumerate(range(1, get_total_frames(dataset_dir), every)):
+        if max_frames is not None and i >= max_frames:
+            print("Reached max frames, stopping")
+            break
+
+        print(f"Processing frame #{frame_id+1:04}... Data Load ",end="")
         start_frame = time.time()
         timer()
 
         # Get new frame
-        rgb1, confidence1, depth1 = get_frames(dataset_dir, i)
+        rgb1, confidence1, depth1 = get_frames(dataset_dir, frame_id)
 
         dimensions = rgb1.shape[0], rgb1.shape[1]
         assert_shape(rgb1, (dimensions[0], dimensions[1], 3))
@@ -89,7 +93,9 @@ def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 1
                                                 confidence_image0=confidence0,
                                                 confidence_image1=confidence1)
         
-        assert model_1_to_0 is not None
+        if model_1_to_0 is None:
+            print(f"Done ({timer()}) - RANSAC failed to find a model - Skipping frame")
+            continue
 
         if transform_0_to_first is None:
             transform_1_to_first = model_1_to_0
@@ -108,7 +114,7 @@ def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 1
         print(f"Done ({timer()}) - Control ", end="")
 
         ## CONTROL
-        point_cloud1_ground_truth = odometry_point_cloud_to_world(point_cloud1, poses[i])
+        point_cloud1_ground_truth = odometry_point_cloud_to_world(point_cloud1, poses[frame_id])
         
         filtered_point_cloud1_ground_truth = (point_cloud1_ground_truth.copy())[confidence1.flatten() >= 2]
 
@@ -296,11 +302,18 @@ def show_random_sample(dataset_path: Path, n: int = 5, seed: int = 42):
 
     random_frames = [random.randint(0, total_frames) for _ in range(0, min(total_frames, n))]
 
-    fig, axes = plt.subplots(nrows=len(random_frames), ncols=3)
-    fig.set_figwidth(15)
-    fig.set_figheight(4 * len(random_frames))
+    show_samples(dataset_path, random_frames)
 
-    for i, frame_id in enumerate(random_frames):
+def show_samples(dataset_path: Path, frame_ids: list[int]):
+    """
+    Show specific samples from the dataset
+    """
+
+    fig, axes = plt.subplots(nrows=len(frame_ids), ncols=3)
+    fig.set_figwidth(15)
+    fig.set_figheight(4 * len(frame_ids))
+
+    for i, frame_id in enumerate(frame_ids):
         rgb, confidence, depth = get_frames(dataset_path, frame_id)
 
         axes[i, 0].imshow(rgb)
@@ -347,12 +360,37 @@ def visualize_point_cloud(point_cloud: np.ndarray, rgb: np.ndarray):
         vis.update_renderer()
 
     vis.destroy_window()
+
+def visualize_light_glue(dataset_dir: Path, frame_id0: int, frame_id1: int):
+
+    rgb0, _, _ = get_frames(dataset_dir, frame_id0)
+    rgb1, _, _ = get_frames(dataset_dir, frame_id1)
+
+    m_kpts0, m_kpts1 =  get_matches(rgb0, rgb1)
+
+    axes = viz2d.plot_images([rgb0, rgb1])
+    viz2d.plot_matches(m_kpts0, m_kpts1, color="lime", lw=0.2)
 ####################################################################################################
 # Point Cloud + 3D Functions
 ####################################################################################################
 
-def compute_euclidean_transform_ransac(image0, point_cloud0, image1, point_cloud1, matching_threshold=300000.0, iterations=100, confidence_image0=None, confidence_image1=None)-> skimage.transform.EuclideanTransform:
-    
+def compute_euclidean_transform_ransac(image0, point_cloud0, image1, point_cloud1, matching_threshold=300.0, iterations=100, confidence_image0=None, confidence_image1=None)-> skimage.transform.EuclideanTransform | None:
+    """
+    Estimate the Euclidean Transform between two images using RANSAC
+
+    Args:
+        image0 (np.ndarray): Image 0
+        point_cloud0 (np.ndarray): Point cloud 0
+        image1 (np.ndarray): Image 1
+        point_cloud1 (np.ndarray): Point cloud 1
+        matching_threshold (float, optional): Matching threshold. Defaults to 300.0.
+        iterations (int, optional): Number of RANSAC iterations. Defaults to 100.
+        confidence_image0 (np.ndarray, optional): Confidence image 0. Defaults to None.
+        confidence_image1 (np.ndarray, optional): Confidence image 1. Defaults to None.
+
+    Returns:
+        skimage.transform.EuclideanTransform | None: Euclidean Transform or None if not found
+    """
     assert_shape(image0, (None, None, 3))
     
     image0_height = image0.shape[0]
@@ -401,6 +439,9 @@ def compute_euclidean_transform_ransac(image0, point_cloud0, image1, point_cloud
     matched_point_cloud0 = point_cloud0[point_cloud0_indices]
     matched_point_cloud1 = point_cloud1[point_cloud1_indices]
 
+    if len(matched_point_cloud0) < 3:
+        return None
+
     best_model = None
     best_inlier_count = 0
 
@@ -422,8 +463,6 @@ def compute_euclidean_transform_ransac(image0, point_cloud0, image1, point_cloud
         if inlier_count > best_inlier_count:
             best_inlier_count = inlier_count
             best_model = model
-
-    assert best_model is not None, "RANSAC failed to find a model"
     
     return best_model
 
