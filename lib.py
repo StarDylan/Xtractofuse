@@ -3,6 +3,7 @@ import time
 import skvideo.io 
 import skimage.io
 import skimage.transform
+from scipy.spatial import cKDTree
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -22,25 +23,25 @@ np.float = np.float64
 np.int = np.int_
 
 
-def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 100.0, every: int = 1, max_frames: tuple | None = None, use_icp: bool = True) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[float]]:
+def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 100.0, every: int = 1, max_frames: tuple | None = None, use_icp: bool = True, sample_percentage: float = 0.01) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, list[float]]]:
     """
-    Convert a video dataset to a ground truth point cloud and an experimental point cloud
-
-    As well as evaluation metrics
+    Convert a video dataset to a ground truth point cloud and an experimental point cloud,
+    while calculating various evaluation metrics.
 
     Args:
         dataset_dir (Path): Path to the dataset
 
     Returns:
-        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]: Point cloud, RGB data, Ground truth point cloud, RSME values
+        tuple[np.ndarray, np.ndarray, np.ndarray, dict]: 
+            - Accumulated point cloud
+            - RGB data for the point cloud
+            - Ground truth point cloud
+            - Dictionary containing metrics for each frame
     """
-
-    #  rgb_images: np.ndarray, depth_images: np.ndarray, confidence_images: np.ndarray, intrinsics: np.ndarray
     transform_0_to_first = None
 
     intrinsics = np.genfromtxt(dataset_dir.joinpath("camera_matrix.csv"), delimiter=',')
     poses = get_poses(dataset_dir)
-
 
     rgb0, confidence0, depth0 = get_frames(dataset_dir, 0)
 
@@ -51,27 +52,45 @@ def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 1
 
     point_cloud0 = image_to_point_cloud(intrinsics, rgb0, depth0)
 
-    # Start out with points from first frame
-
-    # For some reason this modifies the original array, so we copy it
+    # Initialize point clouds and metrics
     point_cloud_all = (point_cloud0.copy())[confidence0.flatten() >= 2]
     rgb_data_all = (rgb0.copy())[confidence0 >= 2]
-
     point_cloud_ground_truth = (point_cloud0.copy())[confidence0.flatten() >= 2]
 
-    print("Processing Frame #1 (for free, since we define it as the origin)")
+    metrics = {
+        "rmse": [],
+        "mae": [],
+        "chamfer": [],
+        "hausdorff": [],
+        "precision": [],
+        "recall": [],
+    }
 
-    rsme = [rsme_point_clouds(point_cloud_all, point_cloud_ground_truth)]
+    print("Processing Frame #1 (for free, since we define it as the origin)")
+    initial_rmse = rmse_point_clouds(point_cloud_all, point_cloud_ground_truth)
+    initial_mae = mae_point_clouds(point_cloud_all, point_cloud_ground_truth)
+    initial_chamfer = chamfer_distance(point_cloud_all, point_cloud_ground_truth)
+    initial_hausdorff = hausdorff_distance(point_cloud_all, point_cloud_ground_truth)
+    initial_precision, initial_recall = precision_recall_point_clouds(point_cloud_all, point_cloud_ground_truth)
+
+    metrics["rmse"].append(initial_rmse)
+    metrics["mae"].append(initial_mae)
+    metrics["chamfer"].append(initial_chamfer)
+    metrics["hausdorff"].append(initial_hausdorff)
+    metrics["precision"].append(initial_precision)
+    metrics["recall"].append(initial_recall)
+
+    print(f"Initial RMSE: {initial_rmse:.2f}, Initial MAE: {initial_mae:.2f}, Initial Chamfer: {initial_chamfer:.2f}, Initial Hausdorff: {initial_hausdorff:.2f}, Initial Precision: {initial_precision:.2f}, Initial Recall: {initial_recall:.2f}")
 
     for i, frame_id in enumerate(range(1, get_total_frames(dataset_dir), every)):
         if max_frames is not None and i >= max_frames:
             print("Reached max frames, stopping")
             break
 
-        print(f"Processing frame #{frame_id+1:04}... Data Load ",end="")
+        print(f"Processing frame #{frame_id+1:04}... Data Load ", end="")
         start_frame = time.time()
         timer()
- 
+
         # Get new frame
         rgb1, confidence1, depth1 = get_frames(dataset_dir, frame_id)
 
@@ -85,13 +104,12 @@ def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 1
         point_cloud1 = image_to_point_cloud(intrinsics, rgb1, depth1)
 
         print(f"Done ({timer()}) - RANSAC ", end="")
- 
-        ## EXPERIMENTAL
+
         model_1_to_0 = compute_euclidean_transform_ransac(rgb0, point_cloud0, 
-                                                rgb1, point_cloud1, 
-                                                matching_threshold=ransac_matching_threshold, iterations=1000,
-                                                confidence_image0=confidence0,
-                                                confidence_image1=confidence1)
+                                                          rgb1, point_cloud1, 
+                                                          matching_threshold=ransac_matching_threshold, iterations=1000,
+                                                          confidence_image0=confidence0,
+                                                          confidence_image1=confidence1)
         
         if model_1_to_0 is None:
             print(f"Done ({timer()}) - RANSAC failed to find a model - Skipping frame")
@@ -100,7 +118,7 @@ def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 1
         if transform_0_to_first is None:
             transform_1_to_first = model_1_to_0
         else:
-            transform_1_to_first = skimage.transform.EuclideanTransform(transform_0_to_first.params @ model_1_to_0.params)
+            transform_1_to_first = transform_0_to_first + model_1_to_0
 
         point_cloud1_world = model_1_to_0(point_cloud1)
 
@@ -112,49 +130,57 @@ def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 1
             o3d_pc0.points = o3d.utility.Vector3dVector(point_cloud0)
             o3d_pc1.points = o3d.utility.Vector3dVector(point_cloud1)
 
-            # Run ICP for fine-tuned alignment
-            threshold = 0.02  # Maximum correspondence point pair distance
             icp_result = o3d.pipelines.registration.registration_icp(
-                o3d_pc1, o3d_pc0, threshold, 
-                model_1_to_0,
+                o3d_pc1, o3d_pc0, 0.02, model_1_to_0,
                 o3d.pipelines.registration.TransformationEstimationPointToPoint()
             )
 
-            
             icp_transform = icp_result.transformation
             point_cloud1 = np.asarray(o3d_pc1.transform(icp_transform).points)
 
-            #  point_cloud1_world, icp_transform = manual_icp(
-            #      point_cloud1, point_cloud0, model_1_to_0.params, max_iterations=20, tolerance=1e-6
-            #  )
-
         print(f"Done ({timer()}) - Control ", end="")
 
-        ## CONTROL
         point_cloud1_ground_truth = odometry_point_cloud_to_world(point_cloud1, poses[frame_id])
-        
         filtered_point_cloud1_ground_truth = (point_cloud1_ground_truth.copy())[confidence1.flatten() >= 2]
 
         point_cloud_ground_truth = np.concatenate((point_cloud_ground_truth, filtered_point_cloud1_ground_truth.copy()))
 
         print(f"Done ({timer()}) - Accumulation ", end="")
 
-        # Filter based on confidence
+        # Filter and sample points
         filtered_point_cloud1 = (point_cloud1_world.copy())[confidence1.flatten() >= 2]
         filtered_video_data1 = (rgb1.copy())[confidence1 >= 2]
-        
-        point_cloud_all = np.concatenate((point_cloud_all, filtered_point_cloud1.copy()))
-        rgb_data_all = np.concatenate((rgb_data_all, filtered_video_data1.copy()))
 
-        print(f"Done ({timer()}) - RSME", end="")
+        num_points_to_sample = int(len(filtered_point_cloud1) * sample_percentage)
+        print("Non GC:", len(filtered_point_cloud1))
+        print("GC:", len(filtered_point_cloud1_ground_truth))
+        sampled_indices = np.random.choice(len(filtered_point_cloud1), num_points_to_sample, replace=False)
+        sampled_point_cloud1 = filtered_point_cloud1[sampled_indices]
+        sampled_rgb_data1 = filtered_video_data1[sampled_indices]
 
-        rsme.append(rsme_point_clouds(point_cloud1_ground_truth, point_cloud1_world))
+        point_cloud_all = np.concatenate((point_cloud_all, sampled_point_cloud1))
+        rgb_data_all = np.concatenate((rgb_data_all, sampled_rgb_data1))
 
-        print(f": {rsme[-1]:.2f} Done ({timer()}) ", end="")
+        print(f"Done ({timer()}) - Metrics ", end="")
 
-        # For next iteration
+        # Compute Metrics
+        rmse_val = rmse_point_clouds(point_cloud1_ground_truth, point_cloud1_world)
+        mae_val = mae_point_clouds(point_cloud1_ground_truth, point_cloud1_world)
+        chamfer_val = chamfer_distance(point_cloud1_ground_truth, point_cloud1_world)
+        hausdorff_val = hausdorff_distance(point_cloud1_ground_truth, point_cloud1_world)
+        precision_val, recall_val = precision_recall_point_clouds(point_cloud1_ground_truth, point_cloud1_world)
+
+        metrics["rmse"].append(rmse_val)
+        metrics["mae"].append(mae_val)
+        metrics["chamfer"].append(chamfer_val)
+        metrics["hausdorff"].append(hausdorff_val)
+        metrics["precision"].append(precision_val)
+        metrics["recall"].append(recall_val)
+
+        print(f"RMSE: {rmse_val:.2f}, MAE: {mae_val:.2f}, Chamfer: {chamfer_val:.2f}, Hausdorff: {hausdorff_val:.2f}, Precision: {precision_val:.2f}, Recall: {recall_val:.2f}")
+
+        print(f"Done ({timer()})", end=" ")
         transform_0_to_first = transform_1_to_first
-        
         point_cloud0 = point_cloud1
         point_cloud0_world = point_cloud1_world
         confidence0 = confidence1
@@ -162,7 +188,8 @@ def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 1
 
         print(f"--- Frame finished in {time.time() - start_frame:.2f}s")
 
-    return point_cloud_all, rgb_data_all, point_cloud_ground_truth, rsme
+    return point_cloud_all, rgb_data_all, point_cloud_ground_truth, metrics
+
 
 
 ####################################################################################################
@@ -616,7 +643,7 @@ def odometry_point_cloud_to_world(point_cloud, pose):
     assert_shape(point_cloud_world, (None, 3))
     return point_cloud_world
 
-def rsme_point_clouds(point_cloud0: np.ndarray, point_cloud1: np.ndarray) -> float:
+def rmse_point_clouds(point_cloud0: np.ndarray, point_cloud1: np.ndarray) -> float:
     num_points = len(point_cloud0)
 
     assert_shape(point_cloud0, (num_points, 3))
@@ -625,6 +652,98 @@ def rsme_point_clouds(point_cloud0: np.ndarray, point_cloud1: np.ndarray) -> flo
     point_euclidean_distance = np.sqrt(((point_cloud0 - point_cloud1) ** 2).sum(axis=1))
 
     return np.sqrt((point_euclidean_distance**2).mean())
+
+def mae_point_clouds(pc1: np.ndarray, pc2: np.ndarray) -> float:
+    """
+    Compute Mean Absolute Error (MAE) between two point clouds.
+
+    Args:
+        pc1 (np.ndarray): First point cloud.
+        pc2 (np.ndarray): Second point cloud.
+
+    Returns:
+        float: MAE value.
+    """
+    if len(pc1) == 0 or len(pc2) == 0:
+        return float('inf')  # Avoid division by zero or invalid metric
+    distances = np.linalg.norm(pc1 - pc2, axis=1)
+    return np.mean(np.abs(distances))
+
+def chamfer_distance(pc1: np.ndarray, pc2: np.ndarray) -> float:
+    """
+    Compute Chamfer Distance between two point clouds.
+
+    Args:
+        pc1 (np.ndarray): First point cloud.
+        pc2 (np.ndarray): Second point cloud.
+
+    Returns:
+        float: Chamfer distance value.
+    """
+
+    if len(pc1) == 0 or len(pc2) == 0:
+        return float('inf')
+
+    tree1 = cKDTree(pc1)
+    tree2 = cKDTree(pc2)
+
+    dist1, _ = tree1.query(pc2, k=1)
+    dist2, _ = tree2.query(pc1, k=1)
+
+    return np.mean(dist1) + np.mean(dist2)
+
+def hausdorff_distance(pc1: np.ndarray, pc2: np.ndarray) -> float:
+    """
+    Compute Hausdorff Distance between two point clouds.
+
+    Args:
+        pc1 (np.ndarray): First point cloud.
+        pc2 (np.ndarray): Second point cloud.
+
+    Returns:
+        float: Hausdorff distance value.
+    """
+
+    if len(pc1) == 0 or len(pc2) == 0:
+        return float('inf')
+
+    tree1 = cKDTree(pc1)
+    tree2 = cKDTree(pc2)
+
+    dist1, _ = tree1.query(pc2, k=1)
+    dist2, _ = tree2.query(pc1, k=1)
+
+    return max(np.max(dist1), np.max(dist2))
+
+def precision_recall_point_clouds(pc1: np.ndarray, pc2: np.ndarray, threshold: float = 0.02) -> tuple[float, float]:
+    """
+    Compute precision and recall between two point clouds based on a distance threshold.
+
+    Args:
+        pc1 (np.ndarray): First point cloud (ground truth).
+        pc2 (np.ndarray): Second point cloud (reconstructed).
+        threshold (float): Distance threshold to consider a point as matched.
+
+    Returns:
+        tuple[float, float]: Precision and recall values.
+    """
+
+    if len(pc1) == 0 or len(pc2) == 0:
+        return 0.0, 0.0
+
+    tree1 = cKDTree(pc1)
+    tree2 = cKDTree(pc2)
+
+    # Precision: Percentage of points in pc2 close to pc1
+    dist2, _ = tree2.query(pc1, k=1)
+    precision = np.mean(dist2 < threshold)
+
+    # Recall: Percentage of points in pc1 close to pc2
+    dist1, _ = tree1.query(pc2, k=1)
+    recall = np.mean(dist1 < threshold)
+
+    return precision, recall
+
 
 ####################################################################################################
 # 2D Image Functions
