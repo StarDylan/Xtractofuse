@@ -22,7 +22,7 @@ np.float = np.float64
 np.int = np.int_
 
 
-def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 100.0, every: int = 1, max_frames: tuple | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[float]]:
+def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 100.0, every: int = 1, max_frames: tuple | None = None, use_icp: bool = True) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[float]]:
     """
     Convert a video dataset to a ground truth point cloud and an experimental point cloud
 
@@ -104,12 +104,25 @@ def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 1
 
         point_cloud1_world = model_1_to_0(point_cloud1)
 
-        print(f"Done ({timer()}) - ICP ", end="")
+        if use_icp:
+            print(f"Done ({timer()}) - ICP ", end="")
 
-        #### ICP here between
-        # point_cloud0_world, point_cloud1_world
-        
-        # We want to move point_cloud1 to point_cloud0
+            o3d_pc0 = o3d.geometry.PointCloud()
+            o3d_pc1 = o3d.geometry.PointCloud()
+            o3d_pc0.points = o3d.utility.Vector3dVector(point_cloud0)
+            o3d_pc1.points = o3d.utility.Vector3dVector(point_cloud1)
+
+            # Run ICP for fine-tuned alignment
+            threshold = 0.02  # Maximum correspondence point pair distance
+            icp_result = o3d.pipelines.registration.registration_icp(
+                o3d_pc1, o3d_pc0, threshold, 
+                model_1_to_0,
+                o3d.pipelines.registration.TransformationEstimationPointToPoint()
+            )
+
+            
+            icp_transform = icp_result.transformation
+            point_cloud1 = np.asarray(o3d_pc1.transform(icp_transform).points)
 
         print(f"Done ({timer()}) - Control ", end="")
 
