@@ -71,7 +71,7 @@ def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 1
         print(f"Processing frame #{frame_id+1:04}... Data Load ",end="")
         start_frame = time.time()
         timer()
-
+ 
         # Get new frame
         rgb1, confidence1, depth1 = get_frames(dataset_dir, frame_id)
 
@@ -100,7 +100,7 @@ def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 1
         if transform_0_to_first is None:
             transform_1_to_first = model_1_to_0
         else:
-            transform_1_to_first = transform_0_to_first + model_1_to_0
+            transform_1_to_first = skimage.transform.EuclideanTransform(transform_0_to_first.params @ model_1_to_0.params)
 
         point_cloud1_world = model_1_to_0(point_cloud1)
 
@@ -123,6 +123,10 @@ def video_to_point_cloud(dataset_dir: Path, ransac_matching_threshold: float = 1
             
             icp_transform = icp_result.transformation
             point_cloud1 = np.asarray(o3d_pc1.transform(icp_transform).points)
+
+            #  point_cloud1_world, icp_transform = manual_icp(
+            #      point_cloud1, point_cloud0, model_1_to_0.params, max_iterations=20, tolerance=1e-6
+            #  )
 
         print(f"Done ({timer()}) - Control ", end="")
 
@@ -479,6 +483,67 @@ def compute_euclidean_transform_ransac(image0, point_cloud0, image1, point_cloud
     
     return best_model
 
+def manual_icp(point_cloud1, point_cloud0, initial_transform, max_iterations=20, tolerance=1e-6):
+    """
+    Manually perform ICP between two point clouds.
+
+    Args:
+        point_cloud1 (np.ndarray): Source point cloud (to be aligned).
+        point_cloud0 (np.ndarray): Target point cloud (reference).
+        initial_transform (np.ndarray): Initial transformation (from RANSAC).
+        max_iterations (int): Maximum number of ICP iterations.
+        tolerance (float): Convergence threshold.
+
+    Returns:
+        np.ndarray: Final transformed source point cloud.
+        np.ndarray: Final transformation matrix.
+    """
+    # Apply initial transformation
+    transformed_points = (initial_transform[:3, :3] @ point_cloud1.T).T + initial_transform[:3, 3]
+    
+    last_error = float('inf')
+
+    for iteration in range(max_iterations):
+        # Step 2: Find correspondences (nearest neighbors)
+        distances = np.linalg.norm(point_cloud0[:, None, :] - transformed_points[None, :, :], axis=2)
+        nearest_indices = np.argmin(distances, axis=0)
+        corresponding_points = point_cloud0[nearest_indices]
+
+        # Step 3: Compute centroids
+        centroid_src = transformed_points.mean(axis=0)
+        centroid_dst = corresponding_points.mean(axis=0)
+
+        # Step 4: Center the points
+        src_centered = transformed_points - centroid_src
+        dst_centered = corresponding_points - centroid_dst
+
+        # Step 5: Compute cross-covariance matrix
+        W = src_centered.T @ dst_centered
+
+        # Step 6: SVD for rotation matrix
+        U, _, VT = np.linalg.svd(W)
+        R = VT.T @ U.T
+        if np.linalg.det(R) < 0:
+            R[:, -1] *= -1  # Ensure a right-handed coordinate system
+
+        # Step 7: Translation vector
+        t = centroid_dst - R @ centroid_src
+
+        # Step 8: Apply transformation
+        transformed_points = (R @ transformed_points.T).T + t
+
+        # Check for convergence
+        mean_error = np.mean(np.linalg.norm(transformed_points - corresponding_points, axis=1))
+        if abs(last_error - mean_error) < tolerance:
+            break
+        last_error = mean_error
+
+    # Combine rotation and translation into final transformation matrix
+    final_transform = np.eye(4)
+    final_transform[:3, :3] = R
+    final_transform[:3, 3] = t
+
+    return transformed_points, final_transform
 
 def quaternion_to_rotation_matrix(quaternion):
     qx, qy, qz, qw = quaternion
