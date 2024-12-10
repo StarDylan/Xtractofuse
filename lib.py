@@ -665,9 +665,12 @@ def mae_point_clouds(pc1: np.ndarray, pc2: np.ndarray) -> float:
         float: MAE value.
     """
     if len(pc1) == 0 or len(pc2) == 0:
-        return float('inf')  # Avoid division by zero or invalid metric
+        return float('inf')
     distances = np.linalg.norm(pc1 - pc2, axis=1)
     return np.mean(np.abs(distances))
+
+tree1 = None
+tree2 = None
 
 def chamfer_distance(pc1: np.ndarray, pc2: np.ndarray) -> float:
     """
@@ -683,7 +686,7 @@ def chamfer_distance(pc1: np.ndarray, pc2: np.ndarray) -> float:
 
     if len(pc1) == 0 or len(pc2) == 0:
         return float('inf')
-
+    global tree1, tree2
     tree1 = cKDTree(pc1)
     tree2 = cKDTree(pc2)
 
@@ -707,15 +710,12 @@ def hausdorff_distance(pc1: np.ndarray, pc2: np.ndarray) -> float:
     if len(pc1) == 0 or len(pc2) == 0:
         return float('inf')
 
-    tree1 = cKDTree(pc1)
-    tree2 = cKDTree(pc2)
-
     dist1, _ = tree1.query(pc2, k=1)
     dist2, _ = tree2.query(pc1, k=1)
 
     return max(np.max(dist1), np.max(dist2))
 
-def precision_recall_point_clouds(pc1: np.ndarray, pc2: np.ndarray, threshold: float = 0.02) -> tuple[float, float]:
+def precision_recall_point_clouds(pc1: np.ndarray, pc2: np.ndarray, threshold: float = 10) -> tuple[float, float]:
     """
     Compute precision and recall between two point clouds based on a distance threshold.
 
@@ -730,9 +730,6 @@ def precision_recall_point_clouds(pc1: np.ndarray, pc2: np.ndarray, threshold: f
 
     if len(pc1) == 0 or len(pc2) == 0:
         return 0.0, 0.0
-
-    tree1 = cKDTree(pc1)
-    tree2 = cKDTree(pc2)
 
     # Precision: Percentage of points in pc2 close to pc1
     dist2, _ = tree2.query(pc1, k=1)
